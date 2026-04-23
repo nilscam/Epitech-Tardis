@@ -40,6 +40,74 @@ def kpi_card(col, label: str, value: str, help_text: str | None = None) -> None:
     col.metric(label, value, help=help_text)
 
 
+def render_fig(fig) -> None:
+    """Rend + ferme la figure. `clear_figure=True` efface les artists mais ne
+    libère pas l'entrée dans le figure manager matplotlib → fuite mémoire
+    cumulative sur sessions Streamlit longues."""
+    st.pyplot(fig, clear_figure=False)
+    plt.close(fig)
+
+
+@st.cache_data(show_spinner=False)
+def compute_route_meta(df: pd.DataFrame, train_cutoff: pd.Timestamp) -> pd.DataFrame:
+    """Agrège les métadonnées de chaque route sur l'historique pré-cutoff.
+
+    Placé ici plutôt qu'inline pour (1) cache sur reruns Streamlit et (2) éviter
+    la fuite test → inférence (on ne regarde que Date < train_cutoff)."""
+    df_train_slice = df[df["Date"] < train_cutoff]
+    groups = df_train_slice.groupby(["Departure station", "Arrival station"])
+    return groups.agg(
+        service=("Service", lambda s: s.mode().iloc[0]),
+        journey_time=("Average journey time", "median"),
+        scheduled=("Number of scheduled trains", "median"),
+        n_months=(TARGET, "count"),
+        avg_delay=(TARGET, "mean"),
+        median_delay=(TARGET, "median"),
+        # Ponctualité réelle au niveau train (seuil industriel 15 min),
+        # pondérée par le nombre de trains (pas la moyenne des moyennes).
+        trains_total=("Number of scheduled trains", "sum"),
+        trains_delayed_15=("Number of trains delayed > 15min", "sum"),
+    ).assign(
+        punctuality=lambda d: np.where(
+            d["trains_total"] > 0,
+            (1 - d["trains_delayed_15"] / d["trains_total"]) * 100,
+            np.nan,
+        ),
+    ).reset_index()
+
+
+@st.cache_data(show_spinner=False)
+def compute_station_stats(
+    df: pd.DataFrame,
+    services: tuple,
+    date_range: tuple,
+    deps: tuple,
+    arrs: tuple,
+) -> pd.DataFrame:
+    """Stats par gare de départ, pondérées par volume de trafic."""
+    mask = (
+        df["Service"].isin(services)
+        & (df["Date"] >= pd.Timestamp(date_range[0]))
+        & (df["Date"] <= pd.Timestamp(date_range[1]))
+    )
+    if deps:
+        mask &= df["Departure station"].isin(deps)
+    if arrs:
+        mask &= df["Arrival station"].isin(arrs)
+    sub = df.loc[mask]
+    return (
+        sub.groupby("Departure station")
+        .agg(
+            AvgDelay=(TARGET, "mean"),
+            MedianDelay=(TARGET, "median"),
+            Trips=("Number of scheduled trains", "sum"),
+            Routes=("Route", "nunique"),
+        )
+        .query("Trips > 100")
+        .sort_values("AvgDelay", ascending=False)
+    )
+
+
 def main() -> None:
     st.title("🚆 TARDIS — *Predicting the Unpredictable*")
     st.caption(
@@ -144,7 +212,9 @@ def main() -> None:
     if selected_arrs:
         mask &= df["Arrival station"].isin(selected_arrs)
 
-    filtered = df.loc[mask].copy()
+    # Pas de .copy() : les consommateurs en aval ne mutent pas filtered (groupby,
+    # mean, pivot_table, boxplot). Éviter l'allocation d'un full-DataFrame par rerun.
+    filtered = df.loc[mask]
 
     # Feedback de volume en bas de sidebar
     n_total = len(df)
@@ -162,18 +232,15 @@ def main() -> None:
     # ---------- KPIs ----------
     st.subheader("📊 Indicateurs clés")
 
-    # Seuils de ponctualité SNCF (standard communiqué par type de service) :
-    # - National courte distance / TER : 5 min
-    # - National grandes lignes / TGV : 15 min ; l'International cale sur ce même seuil ici.
-    PUNCT_THRESHOLDS = {"National": 5.0, "International": 15.0}
-
     total_trips = int(filtered["Number of scheduled trains"].sum())
     total_cancelled = int(filtered["Number of cancelled trains"].sum())
     avg_delay = float(filtered[TARGET].mean())
 
-    # Ponctualité pondérée par service (au lieu d'un seuil unique à 5 min)
-    thresholds = filtered["Service"].map(PUNCT_THRESHOLDS).fillna(5.0)
-    pct_on_time = float((filtered[TARGET] <= thresholds).mean() * 100)
+    # Ponctualité niveau train (seuil industriel 15 min), pondérée par volume.
+    # L'ancienne version comparait la MOYENNE mensuelle à un seuil → métrique
+    # "% trajets-mois à moyenne OK", lue à tort comme du per-train.
+    total_delayed_15 = int(filtered["Number of trains delayed > 15min"].sum())
+    pct_on_time = (1 - total_delayed_15 / total_trips) * 100 if total_trips else 0.0
 
     cancel_rate = (total_cancelled / total_trips * 100) if total_trips else 0.0
 
@@ -182,9 +249,13 @@ def main() -> None:
     kpi_card(c2, "Retard moyen à l'arrivée", f"{avg_delay:.1f} min")
     kpi_card(
         c3,
-        "% à l'heure",
+        "% trains ponctuels (≤ 15 min)",
         f"{pct_on_time:.1f} %",
-        help_text="Seuil par service : National ≤ 5 min, International ≤ 15 min",
+        help_text=(
+            "Part des trains arrivés avec moins de 15 min de retard — seuil SNCF "
+            "standard grandes lignes. Calculé à partir du nombre de trains "
+            "« retardés > 15 min » sur l'ensemble des trains programmés."
+        ),
     )
     kpi_card(c4, "Trains annulés", f"{total_cancelled:,}")
     kpi_card(c5, "Taux d'annulation", f"{cancel_rate:.2f} %")
@@ -220,7 +291,7 @@ def main() -> None:
             ax.set_xlabel("Retard moyen (min)")
             ax.set_ylabel("Nombre de trajets-mois")
             ax.legend()
-            st.pyplot(fig, clear_figure=True)
+            render_fig(fig)
 
         with col_b:
             cat_order = [
@@ -243,7 +314,7 @@ def main() -> None:
             ax.set_xlabel("Trajets-mois")
             ax.set_ylabel("")
             ax.set_title("Catégories de retard")
-            st.pyplot(fig, clear_figure=True)
+            render_fig(fig)
 
         st.subheader("Retard par type de service")
         fig, ax = plt.subplots(figsize=(9, 3.5))
@@ -256,22 +327,18 @@ def main() -> None:
             showfliers=False,
         )
         ax.set_ylabel("Retard moyen (min)")
-        st.pyplot(fig, clear_figure=True)
+        render_fig(fig)
 
     # ---- Tab 2 : Par gare ----
     with tabs[1]:
         st.subheader("Comparatif des gares de départ")
 
-        station_stats = (
-            filtered.groupby("Departure station")
-            .agg(
-                AvgDelay=(TARGET, "mean"),
-                MedianDelay=(TARGET, "median"),
-                Trips=("Number of scheduled trains", "sum"),
-                Routes=("Route", "nunique"),
-            )
-            .query("Trips > 100")
-            .sort_values("AvgDelay", ascending=False)
+        station_stats = compute_station_stats(
+            df,
+            tuple(selected_services),
+            (pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])),
+            tuple(selected_deps),
+            tuple(selected_arrs),
         )
 
         top_n = st.slider("Nombre de gares à afficher", 5, 30, 15, key="top_n_stations")
@@ -286,7 +353,7 @@ def main() -> None:
             )
             ax.set_xlabel("Retard moyen (min)")
             ax.set_ylabel("")
-            st.pyplot(fig, clear_figure=True)
+            render_fig(fig)
 
         with col_b:
             st.markdown("**Top gares les plus ponctuelles**")
@@ -301,7 +368,7 @@ def main() -> None:
             )
             ax.set_xlabel("Retard moyen (min)")
             ax.set_ylabel("")
-            st.pyplot(fig, clear_figure=True)
+            render_fig(fig)
 
         st.markdown("**Tableau détaillé (filtré)**")
         st.dataframe(
@@ -330,7 +397,7 @@ def main() -> None:
         sns.lineplot(data=monthly, x="Date", y=TARGET, marker="o", ax=ax)
         ax.set_ylabel("Retard moyen (min)")
         ax.set_xlabel("")
-        st.pyplot(fig, clear_figure=True)
+        render_fig(fig)
 
         col_a, col_b = st.columns(2)
         with col_a:
@@ -340,7 +407,7 @@ def main() -> None:
             sns.barplot(x=m.index, y=m.values, palette="viridis", ax=ax)
             ax.set_xlabel("Mois")
             ax.set_ylabel("Retard moyen (min)")
-            st.pyplot(fig, clear_figure=True)
+            render_fig(fig)
 
         with col_b:
             st.markdown("**Par année**")
@@ -349,7 +416,7 @@ def main() -> None:
             sns.barplot(x=y.index.astype(int), y=y.values, palette="mako", ax=ax)
             ax.set_xlabel("Année")
             ax.set_ylabel("Retard moyen (min)")
-            st.pyplot(fig, clear_figure=True)
+            render_fig(fig)
 
         st.markdown("**Heatmap : retard moyen par année × mois**")
         pivot = filtered.pivot_table(
@@ -364,7 +431,7 @@ def main() -> None:
             cbar_kws={"label": "min"},
             ax=ax,
         )
-        st.pyplot(fig, clear_figure=True)
+        render_fig(fig)
 
     # ---- Tab 4 : Corrélations ----
     with tabs[3]:
@@ -389,7 +456,7 @@ def main() -> None:
         sns.heatmap(
             corr, cmap="coolwarm", center=0, annot=True, fmt=".2f", square=True, ax=ax
         )
-        st.pyplot(fig, clear_figure=True)
+        render_fig(fig)
 
         st.subheader("Contribution moyenne des causes de retard")
         cause_cols = [
@@ -410,7 +477,7 @@ def main() -> None:
             ax=ax,
         )
         ax.set_xlabel("% moyen du retard total")
-        st.pyplot(fig, clear_figure=True)
+        render_fig(fig)
 
     # ---- Tab 5 : Prédiction ----
     with tabs[4]:
@@ -422,22 +489,19 @@ def main() -> None:
             "à la date de prédiction**."
         )
 
-        # Cutoff train stocké dans l'artifact ; fallback = max des dates train utilisées
-        # au moment du fit. On s'en sert pour ne PAS utiliser de lignes futures comme
-        # meta d'une route à l'inférence (sinon : fuite test → prédiction).
-        train_cutoff = pd.Timestamp(artifact.get("train_cutoff", df["Date"].max()))
-        df_train_slice = df[df["Date"] < train_cutoff]
-
-        route_groups = df_train_slice.groupby(["Departure station", "Arrival station"])
-        route_meta = route_groups.agg(
-            service=("Service", lambda s: s.mode().iloc[0]),
-            journey_time=("Average journey time", "median"),
-            scheduled=("Number of scheduled trains", "median"),
-            n_months=(TARGET, "count"),
-            avg_delay=(TARGET, "mean"),
-            median_delay=(TARGET, "median"),
-            punctuality=(TARGET, lambda s: (s <= 5).mean() * 100),
-        ).reset_index()
+        # Cutoff train stocké dans l'artifact. Si absent (vieux artifact), on
+        # refuse de calculer plutôt que de fallback sur df["Date"].max() — sinon
+        # la période de test se retrouve dans la meta d'inférence (leakage).
+        train_cutoff_raw = artifact.get("train_cutoff")
+        if train_cutoff_raw is None:
+            st.error(
+                "Artifact sans `train_cutoff` : impossible de garantir l'absence "
+                "de fuite test → prédiction. Regénérer `model.joblib` via "
+                "`tardis_model.ipynb`."
+            )
+            st.stop()
+        train_cutoff = pd.Timestamp(train_cutoff_raw)
+        route_meta = compute_route_meta(df, train_cutoff)
 
         MONTH_LABELS = {
             1: "Janvier",
@@ -482,6 +546,10 @@ def main() -> None:
                 route_meta["Departure station"] == dep, "Arrival station"
             ].unique()
         )
+        # Purge la sélection d'arrivée si elle n'est plus desservie depuis la
+        # nouvelle gare de départ (sinon Streamlit lève StreamlitAPIException).
+        if st.session_state.get("pred_arr") not in valid_arrivals:
+            st.session_state.pop("pred_arr", None)
         arr = col_arr.selectbox(
             "Gare d'arrivée",
             valid_arrivals,
@@ -552,12 +620,15 @@ def main() -> None:
                 # manquant (mais le pipeline a un imputer).
                 return pd.DataFrame([{k: row.get(k) for k in features}])
 
-            prediction = float(pipeline.predict(build_row(int(year), int(month)))[0])
+            raw_prediction = float(pipeline.predict(build_row(int(year), int(month)))[0])
 
             # IC correct : ± 1.96 × std(résidus) (le RMSE inclut le biais et n'est
             # pas σ). Fallback sur RMSE si residual_std absent (ancien artifact).
             sigma = artifact["metrics"].get("residual_std", artifact["metrics"]["rmse"])
             bias = artifact["metrics"].get("residual_bias", 0.0)
+            # Correction du biais : residual = y - pred, donc mean(residual) > 0
+            # signale une sous-prédiction systématique → on ajoute bias au point.
+            prediction = raw_prediction + bias
             low = prediction - 1.96 * sigma
             high = prediction + 1.96 * sigma
 
@@ -565,7 +636,8 @@ def main() -> None:
             st.caption(
                 f"Intervalle approximatif (± 1.96 × σ_résidus) : "
                 f"[{low:.1f} ; {high:.1f}] min — σ = {sigma:.2f} min, "
-                f"biais moyen du modèle = {bias:+.2f} min. "
+                f"correction de biais appliquée = {bias:+.2f} min "
+                f"(brute : {raw_prediction:.1f} min). "
                 "Interprétation prudente : résidus hétéroscédastiques, "
                 "la variance réelle dépend du niveau prédit."
             )

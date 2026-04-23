@@ -334,8 +334,19 @@ search.fit(X_train, y_train)
 print(f"Meilleurs hyperparamètres (CV) : {search.best_params_}")
 print(f"RMSE CV : {-search.best_score_:.3f}")
 
+# GridSearchCV a déjà refit best_estimator_ sur tout X_train ; on évite un second
+# fit et on calcule directement les métriques test.
 gb_tuned = search.best_estimator_
-results.append(evaluate("Gradient Boosting (tuné)", gb_tuned, X_train, y_train, X_test, y_test))
+preds_tuned = gb_tuned.predict(X_test)
+rmse_tuned = float(np.sqrt(mean_squared_error(y_test, preds_tuned)))
+mae_tuned = float(mean_absolute_error(y_test, preds_tuned))
+r2_tuned = float(r2_score(y_test, preds_tuned))
+print(f"{'Gradient Boosting (tuné)':35s}  RMSE={rmse_tuned:5.2f}  MAE={mae_tuned:5.2f}  R²={r2_tuned:+.3f}")
+results.append({
+    "model": "Gradient Boosting (tuné)",
+    "RMSE": rmse_tuned, "MAE": mae_tuned, "R2": r2_tuned,
+    "pipeline": gb_tuned,
+})
 """
 )
 
@@ -442,7 +453,15 @@ artifact = {
         "residual_std": float(residuals_best.std()),
         "residual_bias": float(residuals_best.mean()),
     },
-    "best_params": search.best_params_,
+    # Hyperparamètres : les tuning params viennent du GridSearch sur GB ; on ne
+    # les stocke comme "best_params" que si le modèle retenu EST le GB tuné.
+    # Sinon on garde la trace sous une clé explicite pour éviter la confusion.
+    "best_params": (
+        dict(search.best_params_)
+        if best_result["model"] == "Gradient Boosting (tuné)"
+        else None
+    ),
+    "gb_tuning_best_params": dict(search.best_params_),
     "train_cutoff": str(CUTOFF.date()),
 }
 
