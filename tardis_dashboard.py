@@ -65,9 +65,18 @@ def main() -> None:
     # ---------- Sidebar filters ----------
     st.sidebar.header("🎛️ Filtres")
 
+    if st.sidebar.button("🔄 Réinitialiser", use_container_width=True):
+        for k in ("flt_services", "flt_deps", "flt_arrs", "flt_period"):
+            st.session_state.pop(k, None)
+        st.rerun()
+
     services = sorted(df["Service"].dropna().unique().tolist())
     selected_services = st.sidebar.multiselect(
-        "Type de service", services, default=services
+        "Type de service",
+        services,
+        default=services,
+        key="flt_services",
+        placeholder="Tous les services",
     )
 
     min_date = df["Date"].min().to_pydatetime()
@@ -78,17 +87,52 @@ def main() -> None:
         max_value=max_date,
         value=(min_date, max_date),
         format="YYYY-MM",
+        key="flt_period",
     )
 
     all_dep = sorted(df["Departure station"].dropna().unique().tolist())
-    all_arr = sorted(df["Arrival station"].dropna().unique().tolist())
 
-    selected_deps = st.sidebar.multiselect(
-        "Gares de départ (vide = toutes)", all_dep, default=[]
-    )
-    selected_arrs = st.sidebar.multiselect(
-        "Gares d'arrivée (vide = toutes)", all_arr, default=[]
-    )
+    with st.sidebar.expander("🚉 Gares", expanded=False):
+        selected_deps = st.multiselect(
+            "Gares de départ",
+            all_dep,
+            default=[],
+            key="flt_deps",
+            placeholder="Toutes les gares",
+            help="Laisser vide pour inclure toutes les gares de départ.",
+        )
+
+        # Cascade : si une/des gares de départ sont choisies, on restreint
+        # les arrivées aux destinations réellement desservies.
+        if selected_deps:
+            reachable = (
+                df.loc[df["Departure station"].isin(selected_deps), "Arrival station"]
+                .dropna()
+                .unique()
+            )
+            arr_options = sorted(reachable.tolist())
+            arr_help = (
+                f"{len(arr_options)} destination(s) desservie(s) depuis "
+                f"{len(selected_deps)} gare(s) sélectionnée(s)."
+            )
+        else:
+            arr_options = sorted(df["Arrival station"].dropna().unique().tolist())
+            arr_help = "Laisser vide pour inclure toutes les gares d'arrivée."
+
+        # Purge les sélections obsolètes si la gare de départ a changé
+        if "flt_arrs" in st.session_state:
+            st.session_state["flt_arrs"] = [
+                a for a in st.session_state["flt_arrs"] if a in arr_options
+            ]
+
+        selected_arrs = st.multiselect(
+            "Gares d'arrivée",
+            arr_options,
+            default=[],
+            key="flt_arrs",
+            placeholder="Toutes les destinations",
+            help=arr_help,
+        )
 
     mask = (
         df["Service"].isin(selected_services)
@@ -102,7 +146,16 @@ def main() -> None:
 
     filtered = df.loc[mask].copy()
 
+    # Feedback de volume en bas de sidebar
+    n_total = len(df)
+    n_filtered = len(filtered)
+    ratio = n_filtered / n_total if n_total else 0
+    st.sidebar.caption(
+        f"**{n_filtered:,}** / {n_total:,} lignes retenues ({ratio:.0%})"
+    )
+
     if filtered.empty:
+        st.sidebar.warning("Aucune donnée ne correspond aux filtres.")
         st.warning("Aucune donnée ne correspond aux filtres sélectionnés.")
         st.stop()
 
@@ -348,149 +401,129 @@ def main() -> None:
     with tabs[4]:
         st.subheader("🔮 Prédire le retard d'un trajet")
         st.caption(
-            "Renseigne les paramètres d'un trajet et le modèle estime le retard moyen à l'arrivée."
+            "Choisis une gare de départ et d'arrivée existante. "
+            "Les caractéristiques du trajet (service, temps de parcours, volume) "
+            "sont déterminées automatiquement à partir de l'historique."
         )
 
-        with st.form("prediction_form"):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                dep = st.selectbox("Gare de départ", all_dep, index=0)
-                service = st.selectbox("Type de service", services, index=0)
-                year = st.number_input(
-                    "Année", min_value=2018, max_value=2030, value=int(df["Year"].max())
-                )
-            with col2:
-                arr = st.selectbox("Gare d'arrivée", all_arr, index=0)
-                month = st.selectbox("Mois", list(range(1, 13)), index=5)
-                journey_time = st.number_input(
-                    "Temps de parcours moyen (min)",
-                    min_value=10,
-                    max_value=600,
-                    value=int(df["Average journey time"].median()),
-                )
-            with col3:
-                scheduled = st.number_input(
-                    "Nombre de trains planifiés sur le mois",
-                    min_value=1,
-                    max_value=5000,
-                    value=int(df["Number of scheduled trains"].median()),
-                )
-                compare_mode = st.checkbox(
-                    "Comparer un scénario alternatif", value=False
-                )
+        route_groups = df.groupby(["Departure station", "Arrival station"])
+        route_meta = route_groups.agg(
+            service=("Service", lambda s: s.mode().iloc[0]),
+            journey_time=("Average journey time", "median"),
+            scheduled=("Number of scheduled trains", "median"),
+            n_months=(TARGET, "count"),
+            avg_delay=(TARGET, "mean"),
+            median_delay=(TARGET, "median"),
+            punctuality=(TARGET, lambda s: (s <= 5).mean() * 100),
+        ).reset_index()
 
+        MONTH_LABELS = {
+            1: "Janvier", 2: "Février", 3: "Mars", 4: "Avril",
+            5: "Mai", 6: "Juin", 7: "Juillet", 8: "Août",
+            9: "Septembre", 10: "Octobre", 11: "Novembre", 12: "Décembre",
+        }
+        SEASON_MAP = {
+            12: "Winter", 1: "Winter", 2: "Winter",
+            3: "Spring", 4: "Spring", 5: "Spring",
+            6: "Summer", 7: "Summer", 8: "Summer",
+            9: "Autumn", 10: "Autumn", 11: "Autumn",
+        }
+
+        # --- Sélecteurs interactifs (hors formulaire pour la cascade dep → arr) ---
+        departures_with_routes = sorted(route_meta["Departure station"].unique())
+        col_dep, col_arr = st.columns(2)
+        dep = col_dep.selectbox(
+            "Gare de départ",
+            departures_with_routes,
+            key="pred_dep",
+        )
+
+        valid_arrivals = sorted(
+            route_meta.loc[route_meta["Departure station"] == dep, "Arrival station"].unique()
+        )
+        arr = col_arr.selectbox(
+            "Gare d'arrivée",
+            valid_arrivals,
+            key="pred_arr",
+            help=f"{len(valid_arrivals)} destination(s) desservie(s) depuis {dep}.",
+        )
+
+        meta = route_meta[
+            (route_meta["Departure station"] == dep)
+            & (route_meta["Arrival station"] == arr)
+        ].iloc[0]
+
+        # --- Carte "informations du trajet" (dérivées, non modifiables) ---
+        st.markdown(f"#### 🚆 Trajet **{dep} → {arr}**")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Type de service", meta["service"])
+        m2.metric("Temps de parcours médian", f"{meta['journey_time']:.0f} min")
+        m3.metric("Trains planifiés / mois", f"{meta['scheduled']:.0f}")
+        m4.metric(
+            "Ponctualité historique",
+            f"{meta['punctuality']:.0f} %",
+            help=(
+                f"Part des {int(meta['n_months'])} mois observés sur ce trajet "
+                "où le retard moyen est resté ≤ 5 min."
+            ),
+        )
+
+        # --- Formulaire : seulement les paramètres temporels décisionnels ---
+        with st.form("prediction_form"):
+            col_y, col_m = st.columns(2)
+            year = col_y.number_input(
+                "Année",
+                min_value=2018,
+                max_value=2030,
+                value=int(df["Year"].max()),
+                step=1,
+            )
+            month = col_m.selectbox(
+                "Mois",
+                list(range(1, 13)),
+                index=5,
+                format_func=lambda m: f"{m:02d} — {MONTH_LABELS[m]}",
+            )
             submit = st.form_submit_button("Prédire le retard", type="primary")
 
         if submit:
-            if dep == arr:
-                st.warning(
-                    "Gare de départ et d'arrivée identiques — vérifie ta saisie."
-                )
-                st.stop()
-
-            season_map = {
-                12: "Winter",
-                1: "Winter",
-                2: "Winter",
-                3: "Spring",
-                4: "Spring",
-                5: "Spring",
-                6: "Summer",
-                7: "Summer",
-                8: "Summer",
-                9: "Autumn",
-                10: "Autumn",
-                11: "Autumn",
-            }
-
-            def build_row(dep_, arr_, svc, yr, mo, jt, sched) -> pd.DataFrame:
+            def build_row(yr: int, mo: int) -> pd.DataFrame:
                 return pd.DataFrame(
                     [
                         {
-                            "Departure station": dep_,
-                            "Arrival station": arr_,
-                            "Service": svc,
-                            "Season": season_map[mo],
+                            "Departure station": dep,
+                            "Arrival station": arr,
+                            "Service": meta["service"],
+                            "Season": SEASON_MAP[mo],
                             "Year": yr,
                             "Month": mo,
                             "Quarter": (mo - 1) // 3 + 1,
-                            "Average journey time": jt,
-                            "Number of scheduled trains": sched,
+                            "Average journey time": float(meta["journey_time"]),
+                            "Number of scheduled trains": float(meta["scheduled"]),
                             "IsPeakMonth": int(mo in (7, 8, 12)),
-                            "IsParisDeparture": int("PARIS" in dep_.upper()),
-                            "IsParisArrival": int("PARIS" in arr_.upper()),
+                            "IsParisDeparture": int("PARIS" in dep.upper()),
+                            "IsParisArrival": int("PARIS" in arr.upper()),
                         }
                     ]
                 )[features]
 
-            row = build_row(dep, arr, service, year, month, journey_time, scheduled)
-            prediction = float(pipeline.predict(row)[0])
-
-            # Intervalle empirique : RMSE du modèle
+            prediction = float(pipeline.predict(build_row(int(year), int(month)))[0])
             rmse = artifact["metrics"]["rmse"]
-            low = max(0.0, prediction - 1.96 * rmse)
+            low = prediction - 1.96 * rmse
             high = prediction + 1.96 * rmse
 
             st.success(f"**Retard prédit : {prediction:.1f} minutes**")
             st.caption(
-                f"Intervalle de confiance ~95 % (± 1.96 × RMSE) : "
-                f"[{low:.1f} ; {high:.1f}] min — RMSE modèle = {rmse:.2f} min."
+                f"Intervalle approximatif (± 1.96 × RMSE, résidus supposés gaussiens) : "
+                f"[{low:.1f} ; {high:.1f}] min — RMSE modèle = {rmse:.2f} min. "
+                "À interpréter avec prudence (résidus hétéroscédastiques)."
             )
 
-            # Context — retards historiques observés sur ce trajet
-            route_hist = df[
-                (df["Departure station"] == dep) & (df["Arrival station"] == arr)
-            ]
-            if not route_hist.empty:
-                st.info(
-                    f"📚 Historique sur ce trajet ({len(route_hist)} mois) : "
-                    f"moyenne **{route_hist[TARGET].mean():.1f} min**, "
-                    f"médiane **{route_hist[TARGET].median():.1f} min**."
-                )
-
-            if compare_mode:
-                st.markdown("---")
-                st.markdown("#### 🔁 Scénario alternatif")
-                colA, colB, colC = st.columns(3)
-                alt_month = colA.selectbox(
-                    "Mois alt.", list(range(1, 13)), index=0, key="alt_month"
-                )
-                alt_service = colB.selectbox(
-                    "Service alt.",
-                    services,
-                    index=min(1, len(services) - 1),
-                    key="alt_service",
-                )
-                alt_year = colC.number_input(
-                    "Année alt.",
-                    min_value=2018,
-                    max_value=2030,
-                    value=int(year),
-                    key="alt_year",
-                )
-                alt_row = build_row(
-                    dep, arr, alt_service, alt_year, alt_month, journey_time, scheduled
-                )
-                alt_pred = float(pipeline.predict(alt_row)[0])
-                delta = alt_pred - prediction
-                st.metric(
-                    f"Retard prédit (scénario alt.)",
-                    f"{alt_pred:.1f} min",
-                    delta=f"{delta:+.1f} min vs scénario principal",
-                    delta_color="inverse",
-                )
-
-        st.divider()
-        st.markdown("#### 🧠 Qualité du modèle")
-        m = artifact["metrics"]
-        mc1, mc2, mc3 = st.columns(3)
-        mc1.metric("RMSE", f"{m['rmse']:.2f} min")
-        mc2.metric("MAE", f"{m['mae']:.2f} min")
-        mc3.metric("R²", f"{m['r2']:.3f}")
-        st.caption(
-            f"Meilleurs hyperparamètres : `{artifact['best_params']}` · "
-            f"Modèle : Gradient Boosting tuné par GridSearchCV."
-        )
+            st.info(
+                f"📚 **Historique** sur {dep} → {arr} ({int(meta['n_months'])} mois) : "
+                f"retard moyen observé **{meta['avg_delay']:.1f} min**, "
+                f"médiane **{meta['median_delay']:.1f} min**."
+            )
 
     st.divider()
     st.caption(
