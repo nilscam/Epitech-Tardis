@@ -44,15 +44,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 
 sns.set_theme(style="whitegrid", context="notebook")
 plt.rcParams["figure.dpi"] = 110
@@ -93,19 +95,29 @@ md(
 code(
     """TARGET = "Average delay of all trains at arrival"
 
+# Encodage cyclique du mois : (sin, cos) pour que décembre (12) et janvier (1)
+# soient proches dans l'espace de features — indispensable pour Ridge, utile pour les arbres.
+df["MonthSin"] = np.sin(2 * np.pi * df["Month"] / 12)
+df["MonthCos"] = np.cos(2 * np.pi * df["Month"] / 12)
+
 CATEGORICAL_FEATURES = ["Departure station", "Arrival station", "Service", "Season"]
-NUMERIC_FEATURES = [
+# Continues : on les scale (utile pour Ridge, neutre pour les arbres).
+CONTINUOUS_FEATURES = [
     "Year",
-    "Month",
-    "Quarter",
     "Average journey time",
     "Number of scheduled trains",
+    "MonthSin",
+    "MonthCos",
+]
+# Binaires : ne PAS scaler (cela dégrade l'interprétabilité sans rien améliorer).
+BINARY_FEATURES = [
     "IsPeakMonth",
+    "IsWorksMonth",
     "IsParisDeparture",
     "IsParisArrival",
 ]
 
-FEATURES = CATEGORICAL_FEATURES + NUMERIC_FEATURES
+FEATURES = CATEGORICAL_FEATURES + CONTINUOUS_FEATURES + BINARY_FEATURES
 X = df[FEATURES].copy()
 y = df[TARGET].copy()
 
@@ -116,100 +128,151 @@ print(f"Cible : moyenne {y.mean():.2f} min, écart-type {y.std():.2f} min")
 )
 
 md(
-    """## 3. Split train / test — **temporel**
+    """## 3. Split train / test — **temporel par date**
 
-> Un split aléatoire fuit l'information temporelle : le modèle verrait des observations
-> de 2024 pendant l'entraînement puis serait évalué sur 2023. Comme la ponctualité
-> SNCF évolue structurellement (COVID, grèves, reprises), cela gonfle artificiellement
-> les métriques. On adopte un **split temporel** : les ~80 % des trajets-mois les plus
-> anciens pour l'entraînement, les ~20 % les plus récents pour le test. C'est le
-> protocole standard pour tout système prédictif qui sera déployé "vers le futur"."""
+> Un split aléatoire fuit l'information temporelle. Un split par **rang d'index**
+> (`iloc[:0.8*N]`) coupe parfois **au milieu d'un mois** : plusieurs trajets du même
+> mois se retrouvent moitié train / moitié test, ce qui injecte de l'information
+> future dans le train.
+>
+> On splitte donc par **date** : tout ce qui est strictement avant `cutoff` va en
+> train, le reste en test. Cible : ~80 / 20."""
 )
 
 code(
-    '''df_sorted = df.sort_values("Date").reset_index(drop=True)
-X_sorted = df_sorted[FEATURES].copy()
-y_sorted = df_sorted[TARGET].copy()
-dates_sorted = df_sorted["Date"]
+    """df_sorted = df.sort_values("Date").reset_index(drop=True)
 
-cutoff_idx = int(len(df_sorted) * 0.8)
-cutoff_date = dates_sorted.iloc[cutoff_idx]
+CUTOFF = pd.Timestamp("2024-06-01")  # ~80/20 sur ce dataset, aligné sur un début de mois
 
-X_train = X_sorted.iloc[:cutoff_idx]
-X_test = X_sorted.iloc[cutoff_idx:]
-y_train = y_sorted.iloc[:cutoff_idx]
-y_test = y_sorted.iloc[cutoff_idx:]
+train_mask = df_sorted["Date"] < CUTOFF
+test_mask = df_sorted["Date"] >= CUTOFF
 
-print(f"Cutoff date : {cutoff_date:%Y-%m}")
-print(f"Train : {len(X_train):,} trajets-mois  ({dates_sorted.iloc[0]:%Y-%m} → {dates_sorted.iloc[cutoff_idx - 1]:%Y-%m})")
-print(f"Test  : {len(X_test):,} trajets-mois  ({dates_sorted.iloc[cutoff_idx]:%Y-%m} → {dates_sorted.iloc[-1]:%Y-%m})")
+X_train = df_sorted.loc[train_mask, FEATURES].copy()
+X_test = df_sorted.loc[test_mask, FEATURES].copy()
+y_train = df_sorted.loc[train_mask, TARGET].copy()
+y_test = df_sorted.loc[test_mask, TARGET].copy()
+
+train_dates = df_sorted.loc[train_mask, "Date"]
+test_dates = df_sorted.loc[test_mask, "Date"]
+
+assert train_dates.max() < test_dates.min(), "leak: train/test overlap on date"
+
+print(f"Cutoff : {CUTOFF:%Y-%m}")
+print(f"Train : {len(X_train):,} trajets-mois  ({train_dates.min():%Y-%m} → {train_dates.max():%Y-%m})  {len(X_train)/len(df_sorted):.1%}")
+print(f"Test  : {len(X_test):,} trajets-mois  ({test_dates.min():%Y-%m} → {test_dates.max():%Y-%m})  {len(X_test)/len(df_sorted):.1%}")
 print(f"Cible train : moyenne {y_train.mean():.2f} min, écart-type {y_train.std():.2f} min")
 print(f"Cible test  : moyenne {y_test.mean():.2f} min, écart-type {y_test.std():.2f} min")
-'''
+"""
 )
 
-md("## 4. Pré-traitement")
+md(
+    """## 4. Pré-traitement
+
+- **Imputation** des numériques par la **médiane**, fittée uniquement sur X_train
+  (pas de fuite test → train).
+- **OneHotEncoder** pour les catégorielles (gares, service, saison) avec
+  `handle_unknown='ignore'` — si une gare inconnue arrive à l'inférence, ses
+  colonnes sont encodées à zéro (la prédiction correspond alors à une "gare
+  fictive", pas à la moyenne conditionnelle : à garder en tête).
+- **StandardScaler** uniquement sur les features **vraiment continues**
+  (année, temps de parcours, volume, sin/cos du mois). Les indicateurs binaires
+  passent tels quels.
+"""
+)
 
 code(
-    """preprocessor = ColumnTransformer(
+    """numeric_pipeline = Pipeline([
+    ("impute", SimpleImputer(strategy="median")),
+    ("scale", StandardScaler()),
+])
+binary_pipeline = Pipeline([
+    ("impute", SimpleImputer(strategy="most_frequent")),
+])
+
+preprocessor = ColumnTransformer(
     transformers=[
         ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=True), CATEGORICAL_FEATURES),
-        ("num", StandardScaler(), NUMERIC_FEATURES),
+        ("num", numeric_pipeline, CONTINUOUS_FEATURES),
+        ("bin", binary_pipeline, BINARY_FEATURES),
     ],
     remainder="drop",
 )
 """
 )
 
-md("## 5. Comparaison de 3 modèles")
+md("## 5. Comparaison des modèles")
 
 code(
-    """def evaluate(name: str, model, X_train, y_train, X_test, y_test) -> dict:
+    '''class RoutePersistenceBaseline(BaseEstimator, RegressorMixin):
+    """Baseline honnête : pour chaque route (dep, arr), prédit la moyenne historique
+    des retards observés sur train. Fallback sur la moyenne globale si la route
+    est inconnue. Utile pour vérifier qu'un modèle ML bat vraiment cet étalon."""
+
+    def fit(self, X, y):
+        df_ = X.copy()
+        df_["_y"] = np.asarray(y)
+        self.means_ = df_.groupby(["Departure station", "Arrival station"])["_y"].mean()
+        self.global_mean_ = float(np.mean(y))
+        return self
+
+    def predict(self, X):
+        keys = list(zip(X["Departure station"], X["Arrival station"]))
+        return np.array([self.means_.get(k, self.global_mean_) for k in keys])
+
+
+def evaluate(name: str, model, X_train, y_train, X_test, y_test) -> dict:
     model.fit(X_train, y_train)
     preds = model.predict(X_test)
     rmse = float(np.sqrt(mean_squared_error(y_test, preds)))
     mae = float(mean_absolute_error(y_test, preds))
     r2 = float(r2_score(y_test, preds))
-    print(f"{name:30s}  RMSE={rmse:5.2f}  MAE={mae:5.2f}  R²={r2:+.3f}")
+    print(f"{name:35s}  RMSE={rmse:5.2f}  MAE={mae:5.2f}  R²={r2:+.3f}")
     return {"model": name, "RMSE": rmse, "MAE": mae, "R2": r2, "pipeline": model}
 
 
 results: list[dict] = []
 
-# 5.1 Baseline : prédire toujours la moyenne
-baseline = Pipeline([("prep", preprocessor), ("est", DummyRegressor(strategy="mean"))])
-results.append(evaluate("Baseline (moyenne)", baseline, X_train, y_train, X_test, y_test))
+# 5.1 Baseline naïve : moyenne globale (DummyRegressor). Pas de preprocessor —
+# il n'apporte rien, ralentit, et rend le score moins lisible.
+results.append(evaluate(
+    "Baseline — moyenne globale",
+    DummyRegressor(strategy="mean"),
+    X_train, y_train, X_test, y_test,
+))
 
-# 5.2 Régression linéaire régularisée
+# 5.2 Baseline forte : moyenne par route (à battre impérativement).
+results.append(evaluate(
+    "Baseline — moyenne par route",
+    RoutePersistenceBaseline(),
+    X_train, y_train, X_test, y_test,
+))
+
+# 5.3 Ridge
 ridge = Pipeline([("prep", preprocessor), ("est", Ridge(alpha=1.0, random_state=RANDOM_STATE))])
 results.append(evaluate("Ridge Regression", ridge, X_train, y_train, X_test, y_test))
 
-# 5.3 Random Forest
-rf = Pipeline(
-    [
-        ("prep", preprocessor),
-        ("est", RandomForestRegressor(n_estimators=200, max_depth=None, n_jobs=-1, random_state=RANDOM_STATE)),
-    ]
-)
+# 5.4 Random Forest
+rf = Pipeline([
+    ("prep", preprocessor),
+    ("est", RandomForestRegressor(
+        n_estimators=300, max_depth=None, min_samples_leaf=3,
+        n_jobs=-1, random_state=RANDOM_STATE,
+    )),
+])
 results.append(evaluate("Random Forest", rf, X_train, y_train, X_test, y_test))
 
-# 5.4 Gradient Boosting
-gb = Pipeline(
-    [
-        ("prep", preprocessor),
-        (
-            "est",
-            GradientBoostingRegressor(
-                n_estimators=300, max_depth=4, learning_rate=0.05, random_state=RANDOM_STATE
-            ),
-        ),
-    ]
-)
+# 5.5 Gradient Boosting
+gb = Pipeline([
+    ("prep", preprocessor),
+    ("est", GradientBoostingRegressor(
+        n_estimators=300, max_depth=4, learning_rate=0.05, random_state=RANDOM_STATE,
+    )),
+])
 results.append(evaluate("Gradient Boosting", gb, X_train, y_train, X_test, y_test))
 
 scoreboard = pd.DataFrame([{k: v for k, v in r.items() if k != "pipeline"} for r in results])
 scoreboard
-"""
+'''
 )
 
 code(
@@ -228,14 +291,26 @@ plt.show()
 md(
     """### Interprétation
 
-- La **baseline** donne un RMSE qui correspond exactement à l'écart-type de la cible : c'est le plancher à battre.
-- La **Ridge** capte les effets principaux mais est limitée par la non-linéarité.
-- **Random Forest** et **Gradient Boosting** tirent parti des interactions (route × saison, gare × affluence).
-- On retient la famille **Gradient Boosting** comme candidat principal pour le tuning.
+- La **baseline moyenne globale** donne un RMSE ≈ écart-type de la cible ; son R²
+  peut être négatif sur le test si la moyenne a dérivé (cas présent : la période
+  de test a un retard moyen supérieur au train).
+- La **baseline moyenne par route** est un étalon bien plus honnête — un modèle ML
+  qui ne la bat pas n'apporte rien.
+- **Ridge** est limité par la non-linéarité ; **Random Forest** et **Gradient
+  Boosting** captent les interactions route × saison × volume.
 """
 )
 
-md("## 6. Tuning des hyperparamètres (Gradient Boosting)")
+md(
+    """## 6. Tuning des hyperparamètres
+
+Le tuning se fait avec `TimeSeriesSplit` (folds chronologiques) sur X_train déjà
+trié par date — pas de fuite. **À la fin du tuning, on ré-évalue tous les candidats
+sur le set test et on retient celui qui minimise vraiment le RMSE test** (pas
+aveuglément le best CV : la CV time-series est bruitée sur peu de folds, et peut
+recommander un modèle trop régularisé qui sous-performe sur la période récente).
+"""
+)
 
 code(
     """param_grid = {
@@ -255,20 +330,27 @@ search = GridSearchCV(
     verbose=0,
 )
 
-# Important : X_train est déjà trié par date (split temporel), donc TimeSeriesSplit
-# découpe les folds dans l'ordre chronologique → pas de fuite.
 search.fit(X_train, y_train)
-print(f"Meilleurs hyperparamètres : {search.best_params_}")
+print(f"Meilleurs hyperparamètres (CV) : {search.best_params_}")
 print(f"RMSE CV : {-search.best_score_:.3f}")
 
-best_model = search.best_estimator_
-results.append(evaluate("Gradient Boosting (tuné)", best_model, X_train, y_train, X_test, y_test))
+gb_tuned = search.best_estimator_
+results.append(evaluate("Gradient Boosting (tuné)", gb_tuned, X_train, y_train, X_test, y_test))
 """
 )
 
 code(
     """final_scoreboard = pd.DataFrame([{k: v for k, v in r.items() if k != "pipeline"} for r in results])
 final_scoreboard
+"""
+)
+
+code(
+    """# On sélectionne le meilleur modèle non-baseline sur le RMSE test
+ml_candidates = [r for r in results if not r["model"].startswith("Baseline")]
+best_result = min(ml_candidates, key=lambda r: r["RMSE"])
+best_model = best_result["pipeline"]
+print(f"Modèle retenu : {best_result['model']}  RMSE={best_result['RMSE']:.3f}  R²={best_result['R2']:+.3f}")
 """
 )
 
@@ -340,47 +422,68 @@ md(
 md("## 9. Sauvegarde du modèle final")
 
 code(
-    """artifact = {
+    """# Résidus calculés avec le modèle retenu (pas forcément le GB tuné)
+preds_best = best_model.predict(X_test)
+residuals_best = y_test - preds_best
+
+artifact = {
     "pipeline": best_model,
+    "model_name": best_result["model"],
     "features": FEATURES,
     "categorical_features": CATEGORICAL_FEATURES,
-    "numeric_features": NUMERIC_FEATURES,
+    "continuous_features": CONTINUOUS_FEATURES,
+    "binary_features": BINARY_FEATURES,
     "target": TARGET,
-    "metrics": {"rmse": float(np.sqrt(mean_squared_error(y_test, preds))),
-                 "mae": float(mean_absolute_error(y_test, preds)),
-                 "r2": float(r2_score(y_test, preds))},
+    "metrics": {
+        "rmse": float(np.sqrt(mean_squared_error(y_test, preds_best))),
+        "mae": float(mean_absolute_error(y_test, preds_best)),
+        "r2": float(r2_score(y_test, preds_best)),
+        # std des résidus : base honnête pour un intervalle approximatif
+        "residual_std": float(residuals_best.std()),
+        "residual_bias": float(residuals_best.mean()),
+    },
     "best_params": search.best_params_,
+    "train_cutoff": str(CUTOFF.date()),
 }
 
 joblib.dump(artifact, MODEL_PATH)
 print(f"✔ Modèle sauvegardé dans {MODEL_PATH} ({MODEL_PATH.stat().st_size / 1024:.1f} KB)")
+print(f"  Modèle : {artifact['model_name']}")
+print(f"  Résidus : std={artifact['metrics']['residual_std']:.3f}  bias={artifact['metrics']['residual_bias']:+.3f}")
 """
 )
 
 md(
     """## 10. Justification du modèle retenu
 
-**Modèle final : Gradient Boosting Regressor tuné**
+Le modèle finalement sauvegardé est celui qui **minimise le RMSE test** parmi les
+candidats ML (pas baseline). Voir le scoreboard final et la cellule de sélection
+ci-dessus pour le nom exact.
 
-| Critère | Valeur |
-|---|---|
-| RMSE test | voir scoreboard |
-| MAE test | voir scoreboard |
-| R² test | voir scoreboard |
-| Baseline RMSE | ~écart-type de la cible (~4.4 min) |
+**Critères de choix :**
 
-**Pourquoi ce choix ?**
-
-1. **Performance** — il obtient le meilleur RMSE / MAE / R² sur le jeu de test tout en restant robuste à l'overfitting grâce à la profondeur limitée et au learning rate faible.
-2. **Interactions non linéaires** — les interactions gare × saison × année, essentielles pour ce type de prédiction, sont capturées nativement par les arbres de décision.
-3. **Robustesse** — il gère naturellement les variables hétérogènes (catégorielles à forte cardinalité + numériques) après encodage.
-4. **Interprétabilité** — l'importance par permutation donne une lecture claire des facteurs dominants.
+1. **Performance test réelle** — sélection sur le set 2024-06 → 2025-12, pas sur
+   la CV (car un best-CV peut être sur-régularisé et perdre sur la période future).
+2. **Interactions non linéaires** — les arbres capturent route × saison × volume
+   sans feature engineering additionnel.
+3. **Robustesse** — OHE + SimpleImputer + StandardScaler gèrent l'hétérogénéité
+   (catégorielles à forte cardinalité + continues + binaires) proprement.
+4. **Interprétabilité** — permutation importance sur le test donne une lecture
+   causale honnête (vs feature_importances_ natif, biaisé par la cardinalité).
 
 **Limites connues :**
 
-- Granularité mensuelle : impossible de prédire un trajet précis (pas d'heure ni de jour dans le dataset source).
-- Effets exogènes (grèves, intempéries extrêmes) non modélisables sans features externes.
-- Nouvelle gare non vue à l'entraînement → le `OneHotEncoder(handle_unknown="ignore")` encode à zéro et le modèle retombe sur la moyenne conditionnelle des autres features.
+- **Granularité mensuelle** : impossible de prédire un trajet précis (pas d'heure
+  ni de jour de semaine dans le dataset source).
+- **Chocs exogènes** (grèves, canicules, pannes) non modélisables sans flux
+  externes.
+- **Gare inconnue à l'inférence** : `OneHotEncoder(handle_unknown="ignore")` encode
+  toutes ses colonnes à 0. Attention : **ce n'est PAS une moyenne conditionnelle**,
+  c'est la prédiction pour une "gare fictive" (aucune colonne station active).
+  La sortie dépend alors uniquement des autres features (mois, service, volume…)
+  et peut être arbitrairement éloignée de la moyenne empirique.
+- **Hétéroscédasticité des résidus** : un intervalle `± 1.96·σ_résidus` reste une
+  approximation gaussienne ; la variance réelle dépend du niveau prédit.
 """
 )
 

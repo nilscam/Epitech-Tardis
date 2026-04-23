@@ -205,47 +205,71 @@ comment_cols = [c for c in df.columns if "comments" in c.lower()]
 df = df.drop(columns=comment_cols)
 print(f"Colonnes commentaires supprimées : {comment_cols}")
 
-# Drop duplicates — important de le faire APRÈS normalisation des gares
-# (sinon 'PARIS LYON' et 'Paris Lyon' comptent comme des lignes distinctes)
-before = len(df)
-df = df.drop_duplicates()
-print(f"Doublons supprimés : {before - len(df)}")
-
-# Drop rows without target or without essential keys (incluant parasites '0' → NA)
 TARGET = "Average delay of all trains at arrival"
 essentials = ["Date", "Service", "Departure station", "Arrival station", TARGET]
+
+# Drop rows without target or essential keys
 before = len(df)
 df = df.dropna(subset=essentials).reset_index(drop=True)
 print(f"Lignes supprimées pour valeurs essentielles manquantes : {before - len(df)}")
+
+# Dedup strict : lignes strictement identiques après normalisation
+before = len(df)
+df = df.drop_duplicates()
+print(f"Doublons exacts supprimés : {before - len(df)}")
+
+# Dedup "logique" : même (route, date, service) avec valeurs divergentes = lignes rééditées.
+# On agrège par moyenne (sur les colonnes numériques) — choix conservateur et reproductible.
+num_cols_remaining = [c for c in NUMERIC_COLS if c in df.columns]
+key = ["Departure station", "Arrival station", "Date", "Service"]
+before = len(df)
+agg = {c: "mean" for c in num_cols_remaining}
+df = df.groupby(key, as_index=False, dropna=False).agg(agg)
+print(f"Doublons logiques (même route/date/service) agrégés : {before - len(df)}")
+
+# Les couples (route, date) sans Service dans la clé peuvent légitimement apparaître 2 fois
+# (National + International sur la même ligne le même mois) — on les conserve.
+still_dup = df.duplicated(subset=["Departure station", "Arrival station", "Date"]).sum()
+print(f"Paires restantes (route+date) avec 2 services distincts : {still_dup}")
+
+# Valeurs cible aberrantes (ex. retards moyens < -30 min physiquement impossibles à l'échelle mensuelle)
+# On les supprime plutôt que de clipper : clipper injecte un artefact de modélisation.
+# Ce filtre reste fait sur TOUT le dataset car on juge ces valeurs corrompues à la source
+# (pas un signal à apprendre). Pas de dépendance à train/test ici.
+before = len(df)
+df = df[df[TARGET].between(-30, 120)].reset_index(drop=True)
+print(f"Lignes cible hors [-30, 120] min supprimées : {before - len(df)}")
 
 print(f"Shape finale après nettoyage : {df.shape}")
 """
 )
 
-code(
-    """# Clip the extreme negative target outliers (trains arriving early by >60 min is unrealistic in this context)
-neg_outliers = (df[TARGET] < -30).sum()
-pos_outliers = (df[TARGET] > 120).sum()
-print(f"Valeurs cible < -30 min : {neg_outliers}")
-print(f"Valeurs cible > 120 min : {pos_outliers}")
+md(
+    """### Note sur la cible
 
-# Plafonnement douux (winsorisation) — conservative, pour limiter l'impact sans perdre d'infos
-df[TARGET] = df[TARGET].clip(lower=-30, upper=120)
+`Average delay of all trains at arrival` est la **moyenne des retards (minutes) sur
+les trains effectivement circulants (non annulés)** pour une liaison sur un mois.
+Dans le dataset source, quelques lignes affichent des moyennes légèrement négatives
+(trains systématiquement en avance à l'arrivée). On les conserve dans la plage
+`[-30, 120]` min ; au-delà c'est considéré comme corruption.
+
+Les valeurs manquantes des **autres** colonnes numériques ne sont PAS imputées ici :
+l'imputation doit être fittée sur le seul set d'entraînement (via un `SimpleImputer`
+intégré au pipeline du modèle, cf. `tardis_model.ipynb`), sinon il y a fuite de
+données du test vers le train.
 """
 )
 
 code(
-    """# Impute missing values on numeric columns with their median (ligne restante après dropna essentials)
-remaining_nulls = df.isnull().sum()
-remaining_nulls = remaining_nulls[remaining_nulls > 0]
-print("Nulls restants avant imputation :")
-print(remaining_nulls)
-
-num_cols_remaining = [c for c in NUMERIC_COLS if c in df.columns]
-df[num_cols_remaining] = df[num_cols_remaining].fillna(df[num_cols_remaining].median(numeric_only=True))
-
-print()
-print(f"Nulls après imputation : {df.isnull().sum().sum()}")
+    """# Sanity check : les pourcentages de causes sont censés sommer à 100.
+cause_cols = [c for c in df.columns if c.startswith("Pct delay")]
+cause_sum = df[cause_cols].sum(axis=1)
+print("Somme des % causes (par ligne) :")
+print(cause_sum.describe().round(2))
+print(f"Lignes avec somme < 90 % : {(cause_sum < 90).sum()}")
+print(f"Lignes avec somme > 110 % : {(cause_sum > 110).sum()}")
+# On ne corrige pas ces lignes : c'est un signal de qualité source à documenter,
+# pas à masquer par normalisation.
 """
 )
 
@@ -270,8 +294,10 @@ def season_from_month(m: int) -> str:
 
 df["Season"] = df["Month"].apply(season_from_month)
 
-# Mois d'affluence (été + décembre = vacances scolaires, fin d'année)
+# Affluence voyageurs (été + Noël) et travaux lourds SNCF (juin→sept) sont DEUX
+# phénomènes différents : on sépare les deux features au lieu de les mélanger.
 df["IsPeakMonth"] = df["Month"].isin([7, 8, 12]).astype(int)
+df["IsWorksMonth"] = df["Month"].isin([6, 7, 8, 9]).astype(int)
 
 # Route (identifiant compact)
 df["Route"] = df["Departure station"] + " → " + df["Arrival station"]
@@ -296,8 +322,13 @@ df["DelayCategory"] = pd.cut(
 )
 
 print("Nouvelles colonnes :")
-print([c for c in df.columns if c in {"Year","Month","Quarter","Season","IsPeakMonth","Route","IsParisDeparture","IsParisArrival","CancellationRate","DepartureDelayRate","SevereDelayRate","DelayCategory"}])
-df[["Date","Route","Year","Month","Season","IsPeakMonth","CancellationRate","DelayCategory"]].head()
+new_cols = {
+    "Year", "Month", "Quarter", "Season", "IsPeakMonth", "IsWorksMonth",
+    "Route", "IsParisDeparture", "IsParisArrival",
+    "CancellationRate", "DepartureDelayRate", "SevereDelayRate", "DelayCategory",
+}
+print([c for c in df.columns if c in new_cols])
+df[["Date","Route","Year","Month","Season","IsPeakMonth","IsWorksMonth","CancellationRate","DelayCategory"]].head()
 """
 )
 

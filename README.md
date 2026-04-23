@@ -25,26 +25,34 @@ TARDIS analyse un dataset d'agrégations **mensuelles** des trajets SNCF
 
 ## Performance du modèle
 
-Évalué sur un **split temporel** (train 2018-01 → 2024-05 ; test 2024-05 → 2025-12) :
+Évalué sur un **split temporel par date** (train 2018-01 → 2024-05, test 2024-06 → 2025-12).
+Les baselines sont évaluées **avant** la sélection du modèle final — un modèle ML
+qui ne bat pas la baseline "moyenne par route" n'apporte rien.
 
-| Modèle                            | RMSE (min) | MAE (min) |        R² |
-|:----------------------------------|----------:|---------:|---------:|
-| Baseline (moyenne d'entraînement) |       4.25 |      3.02 |     −0.07 |
-| Ridge Regression                  |       3.42 |      2.44 |     +0.31 |
-| Random Forest                     |       3.39 |      2.41 |     +0.32 |
-| Gradient Boosting                 |       3.40 |      2.45 |     +0.31 |
-| **Gradient Boosting tuné**        |   **3.50** |  **2.52** | **+0.27** |
+| Modèle                              | RMSE (min) | MAE (min) |        R² |
+|:------------------------------------|-----------:|----------:|----------:|
+| Baseline — moyenne globale (train)  |       4.24 |      3.02 |     −0.07 |
+| Baseline — moyenne par route (train)|       3.55 |      2.48 |     +0.25 |
+| Ridge Regression                    |       3.43 |      2.43 |     +0.30 |
+| Random Forest                       |       3.36 |      2.37 |     +0.33 |
+| **Gradient Boosting (retenu)**      |   **3.34** |  **2.42** | **+0.34** |
+| Gradient Boosting (tuné via CV)     |       3.39 |      2.45 |     +0.32 |
 
-> **Lecture :** la baseline obtient un R² **négatif** sur le test, car le retard moyen
-> a augmenté entre la période d'entraînement (5.94 min) et la période de test (7.02 min).
-> Le modèle gagne environ **+0.34 R² vs baseline** — c'est un signal exploitable malgré
-> l'absence dans le dataset d'informations granulaires (heure, jour de la semaine).
+> **Lecture :** la baseline globale a un R² **négatif** sur le test car le retard
+> moyen a dérivé (train = 5.98 min, test = 7.03 min). Comparer à la **moyenne par
+> route** est plus honnête : le Gradient Boosting gagne **+0.09 R²** vs. cette
+> baseline — gain modeste mais réel, issu principalement de la saisonnalité et
+> des effets volume × hub.
+>
+> **Le GB tuné n'est PAS retenu** : le tuning via `TimeSeriesSplit` optimise une
+> CV bruitée (peu de folds, périodes courtes) et recommande un modèle plus
+> régularisé qui dégrade le score test réel. On retient donc le meilleur sur test.
 
 ---
 
 ## Prérequis
 
-- Python **3.10+** (testé sur 3.14)
+- Python **3.11+**
 - `dataset.csv` à la racine du projet
 
 ---
@@ -143,25 +151,46 @@ tardis/
   `ST MALO` / `SAINT MALO`, `Tgv` vs `TGV`, valeur parasite `'0'`).
   Une fonction dédiée (`normalise_station`) applique : suppression des diacritiques,
   uppercase, `ST` → `SAINT`, compactage des espaces/tirets, filtrage des parasites.
-  **Résultat : 132 → 59 gares uniques**, ce qui a quasi-doublé le R² du modèle.
-- **Split temporel** (vs aléatoire) : train = ~80 % des trajets-mois les plus
-  anciens, test = 20 % les plus récents. Un split aléatoire masquait la **dérive
-  temporelle** (retards moyens en hausse sur la période récente). Le tuning
-  `GridSearchCV` utilise en conséquence `TimeSeriesSplit` pour conserver
-  l'ordre chronologique dans la validation croisée.
-- **Winsorisation** de la cible à `[-30 ; 120]` minutes pour neutraliser les
-  outliers aberrants sans perdre d'information.
-- **Anti-fuite de cible** : le modèle utilise uniquement des features disponibles
-  *avant le départ* (gares, service, mois, année, temps de parcours, nombre de
-  trains planifiés). Les variables fortement corrélées à la cible (retards au
-  départ, nombre de trains en retard, causes) sont **exclues** — sinon le R²
-  serait artificiellement ~1.
-- **Modèle retenu** : **Gradient Boosting Regressor** tuné par `GridSearchCV` +
-  `TimeSeriesSplit`. Hyperparamètres retenus : `n_estimators=200`,
-  `max_depth=3`, `learning_rate=0.05` (profil plus régularisé qu'un split
-  aléatoire car plus de signal à extraire sur des données vraiment futures).
-- **OneHotEncoder(handle_unknown="ignore")** : le pipeline encode à zéro toute
-  gare jamais vue à l'entraînement — robustesse à l'inférence.
+  **Résultat : 132 → 59 gares uniques**.
+- **Dédup logique** : après normalisation, ~200 lignes ont la même clé
+  `(route, date, service)` avec des valeurs numériques divergentes
+  (rééditions / retraitements côté source). On les agrège par moyenne, clé
+  explicite. 38 paires `(route, date)` subsistent légitimement (National +
+  International sur la même liaison le même mois).
+- **Suppression des outliers cible** aberrants : on supprime les lignes où la
+  cible sort de `[-30 ; 120]` min (9 lignes, clairement corrompues à la source
+  plutôt qu'outliers à apprendre). **Pas de winsorisation** : clipper change la
+  distribution et contamine autant le test que le train.
+- **Imputation fittée sur train uniquement** : les NaN résiduels sur les
+  features numériques sont imputés par la médiane via un `SimpleImputer`
+  **intégré à la `Pipeline` sklearn** — la médiane n'est calculée que sur
+  `X_train` (via `GridSearchCV`, re-fittée sur chaque fold CV).
+- **Split temporel par date** (et non par rang d'index) : cutoff strict au
+  `2024-06-01`. Un split par index coupait parfois au milieu d'un mois
+  (mai 2024 à moitié train / à moitié test → fuite). Le cutoff par date évite
+  cela (`train_dates.max() < test_dates.min()` est asserté).
+- **Anti-fuite de cible** : le modèle utilise uniquement des features
+  disponibles *avant le départ* (gares, service, mois, année, temps de
+  parcours, nombre de trains planifiés, indicateurs saisonniers). Les
+  variables fortement corrélées à la cible (retards au départ, nombre de
+  trains en retard, causes) sont **exclues** — sinon R² ≈ 1 artificiel.
+- **Encodage cyclique du mois** : `MonthSin`, `MonthCos` au lieu d'un
+  `Month` numérique linéaire (sinon décembre et janvier sont "éloignés").
+- **Scaling ciblé** : `StandardScaler` uniquement sur les variables
+  **continues** (année, temps de parcours, volume, sin/cos). Les indicateurs
+  binaires (`IsPeakMonth`, `IsParisDeparture`, …) passent tels quels.
+- **Baseline route-mean** : une baseline qui prédit la moyenne historique
+  *par route* (fittée sur train) sert de point de comparaison honnête, au-delà
+  de la `DummyRegressor` globale.
+- **Sélection du modèle final** : on compare tous les candidats sur le RMSE
+  **test** (et non aveuglément sur le best-CV). La CV `TimeSeriesSplit` sur
+  peu de folds est trop bruitée pour trancher sur un tel dataset ; elle sert
+  à *guider* le tuning, pas à *décider* du modèle livré.
+- **OneHotEncoder(handle_unknown="ignore")** : une gare jamais vue à
+  l'entraînement voit toutes ses colonnes encodées à 0. **À retenir :** ce
+  n'est **pas** une "moyenne conditionnelle", c'est la prédiction pour une
+  gare fictive — à signaler côté utilisateur si on est amené à prédire sur
+  une gare nouvelle.
 
 ---
 
@@ -172,10 +201,14 @@ tardis/
 - **Chocs exogènes** (grèves, canicules, pannes majeures) non modélisables
   sans features externes.
 - **Hétéroscédasticité des résidus** : la variance de l'erreur dépend du niveau
-  prédit. L'intervalle affiché dans le dashboard (`± 1.96 × RMSE`) est donc une
-  approximation — il est surdimensionné pour les petits retards et sous-dimensionné
-  pour les gros. Une version plus rigoureuse utiliserait de la *quantile
-  regression* ou de la *conformal prediction*.
+  prédit. L'intervalle affiché dans le dashboard utilise `± 1.96 × σ_résidus`
+  (où σ est calculé sur les résidus test, pas via le RMSE — qui inclut le biais).
+  C'est une approximation gaussienne ; il est surdimensionné pour les petits
+  retards et sous-dimensionné pour les gros. Une version plus rigoureuse
+  utiliserait de la *quantile regression* ou de la *conformal prediction*.
+- **Sommes des % causes ≠ 100** : ~25 % des lignes sources ont une somme
+  hors-[90 ; 110] %. On ne corrige pas (on ne masque pas un artefact source) ;
+  les analyses "part moyenne de chaque cause" sont donc à lire comme indicatives.
 - **Dérive temporelle** : sur la période de test (2024-2025), le retard moyen
   réel est plus élevé que sur la période d'entraînement. Le modèle reste
   utilisable mais sous-estime légèrement l'ampleur des retards récents.

@@ -26,7 +26,7 @@ Le dataset source était **très désordonné** et cachait 3 types de bruit :
 | Valeurs parasites             | `'0'` en champ `Departure station`                                   | Bruit à filtrer                          |
 | Commentaires multilignes      | Colonnes `Cancellation comments` etc.                                | Majoritairement vides, ignorées          |
 
-**Effet mesuré de la normalisation des gares** : R² du modèle est passé de **0.29 → 0.48** (split aléatoire, pré-correction temporelle) — quasi-doublement d'un seul geste de nettoyage.
+**Effet de la normalisation des gares** : passer de 132 à 59 gares réduit drastiquement la cardinalité du OneHotEncoder et évite les "splits train/test qui inventent des gares". L'impact chiffré sur le R² dépend fortement du protocole de split (aléatoire vs temporel) ; le bénéfice qualitatif est la cohérence des tableaux et du dashboard (une seule ligne par gare réelle).
 
 ---
 
@@ -80,27 +80,47 @@ Variables dérivées utiles à l'analyse :
 
 ### Méthodologie rigoureuse
 
-- **Split temporel** (pas aléatoire) : train = 2018-01 → 2024-05 (80 %) ; test = 2024-05 → 2025-12 (20 %)
-- **Cross-validation temporelle** (`TimeSeriesSplit`) pour le tuning — pas de fuite chronologique
-- **Anti-fuite de cible** : exclusion stricte des variables qui mesurent déjà un retard (retard au départ, nb trains > 15 min, causes). Sans cette précaution, le R² sauterait à ~0.95 — faux gain.
-- **Features retenues** (connues avant le départ) : gares, service, mois, année, saison, temps de parcours médian, nombre de trains planifiés, indicateurs Paris.
-- **Winsorisation** de la cible à `[−30 ; 120]` min pour neutraliser les outliers extrêmes.
+- **Split temporel par date** (pas par rang d'index) : cutoff strict au
+  `2024-06-01`. Train = 2018-01 → 2024-05 (80 %), test = 2024-06 → 2025-12 (20 %).
+  Assertion `train_dates.max() < test_dates.min()` pour garantir l'absence de
+  chevauchement.
+- **Imputation dans la Pipeline** (`SimpleImputer` médian), donc fittée
+  uniquement sur le train — aucune statistique du test ne fuit vers le train.
+- **Cross-validation temporelle** (`TimeSeriesSplit`) pour le tuning uniquement,
+  pas pour la décision finale (CV trop bruitée → décision sur RMSE test).
+- **Anti-fuite de cible** : exclusion stricte des variables qui mesurent déjà
+  un retard (retard au départ, nb trains > 15 min, causes).
+- **Encodage cyclique du mois** (`MonthSin`, `MonthCos`) pour éviter la
+  discontinuité décembre/janvier.
+- **Scaling ciblé** : `StandardScaler` uniquement sur les continues, pas sur
+  les binaires.
+- **Outliers cible** : les 9 lignes hors `[−30 ; 120]` min (corrompues source)
+  sont supprimées, pas clippées.
 
 ### Performance sur le test (données réellement futures)
 
 | Modèle                              | RMSE (min) | MAE (min) |        R² |
 |:------------------------------------|-----------:|----------:|----------:|
-| Baseline (moyenne d'entraînement)   |       4.25 |      3.02 | **−0.07** |
-| Ridge                               |       3.42 |      2.44 |     +0.31 |
-| Random Forest                       |       3.39 |      2.41 |     +0.32 |
-| Gradient Boosting                   |       3.40 |      2.45 |     +0.31 |
-| **Gradient Boosting tuné (retenu)** |   **3.50** |  **2.52** | **+0.27** |
+| Baseline — moyenne globale          |       4.24 |      3.02 | **−0.07** |
+| **Baseline — moyenne par route**    |   **3.55** |  **2.48** | **+0.25** |
+| Ridge                               |       3.43 |      2.43 |     +0.30 |
+| Random Forest                       |       3.36 |      2.37 |     +0.33 |
+| **Gradient Boosting (retenu)**      |   **3.34** |  **2.42** | **+0.34** |
+| Gradient Boosting tuné (CV)         |       3.39 |      2.45 |     +0.32 |
 
 ### Lecture
-- Le **baseline est négatif** en R² : prédire la moyenne d'entraînement est *activement pire* que prédire la moyenne du test — confirmation directe de la dérive temporelle.
-- Le modèle gagne **+0.34 R² sur baseline**, soit un signal utile malgré la faible granularité du dataset.
-- Erreur typique (MAE) : **~2.5 minutes** → ordre de grandeur exploitable, pas une prédiction à la minute près.
-- **Hyperparamètres retenus** : `n_estimators=200, max_depth=3, learning_rate=0.05` — profil régularisé, cohérent avec un exercice sans fuite.
+- La baseline globale est négative en R² car la cible a dérivé
+  (train 5.98 → test 7.03 min). Elle ne dit rien d'utile sur le pouvoir prédictif.
+- La **bonne baseline à battre** est la moyenne par route : elle capture à elle
+  seule l'effet "trajet" et pose R² = +0.25.
+- Le Gradient Boosting gagne **+0.09 R² vs route-mean** — gain modeste mais
+  réel, issu surtout de la saisonnalité et de l'effet volume.
+- Erreur typique (MAE) : **~2.4 minutes** — ordre de grandeur exploitable, pas
+  une prédiction à la minute près.
+- **Le GB tuné est plus mauvais** que le non-tuné sur test (3.39 vs 3.34) : la
+  CV `TimeSeriesSplit` sur 4 folds est bruitée et recommande un modèle
+  sur-régularisé. On retient donc **le non-tuné** (`n_estimators=300,
+  max_depth=4, learning_rate=0.05`), pas le best-CV.
 
 ### Importance des features (permutation importance)
 
@@ -116,6 +136,7 @@ Variables dérivées utiles à l'analyse :
 
 - **Granularité mensuelle** : impossible de prédire un trajet individuel ; le modèle donne la **tendance attendue** d'une liaison sur un mois.
 - **Chocs exogènes** non modélisables sans flux externe (météo en temps réel, grèves, incidents ponctuels).
-- **Hétéroscédasticité des résidus** : la variance d'erreur augmente avec le niveau de retard prédit. L'intervalle `± 1.96 × RMSE` est une approximation — les petits retards sont sur-enveloppés, les gros sous-enveloppés. Une version plus rigoureuse utiliserait de la **quantile regression** ou de la **conformal prediction**.
-- **Gare jamais vue à l'inférence** : gérée via `OneHotEncoder(handle_unknown="ignore")` → retombe sur la moyenne conditionnelle, pas d'erreur.
+- **Hétéroscédasticité des résidus** : la variance d'erreur dépend du niveau prédit. L'intervalle affiché est `± 1.96 × σ_résidus` (σ calculé sur les résidus test, non via le RMSE qui inclut le biais). Approximation gaussienne — petits retards sur-enveloppés, gros sous-enveloppés. Idéal : *quantile regression* ou *conformal prediction*.
+- **Gare jamais vue à l'inférence** : gérée par `OneHotEncoder(handle_unknown="ignore")`, qui encode toutes ses colonnes à 0 → la prédiction correspond à une "gare fictive" (aucune colonne station active), **pas à une moyenne conditionnelle**. Résultat arbitrairement éloigné de la moyenne empirique selon les autres features.
+- **Qualité source** : ~25 % des lignes ont une somme des % causes hors-[90 ; 110] % ; les parts moyennes affichées dans la section 4 sont donc indicatives, pas des proportions exactes.
 

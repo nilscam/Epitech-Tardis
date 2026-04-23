@@ -162,16 +162,30 @@ def main() -> None:
     # ---------- KPIs ----------
     st.subheader("📊 Indicateurs clés")
 
+    # Seuils de ponctualité SNCF (standard communiqué par type de service) :
+    # - National courte distance / TER : 5 min
+    # - National grandes lignes / TGV : 15 min ; l'International cale sur ce même seuil ici.
+    PUNCT_THRESHOLDS = {"National": 5.0, "International": 15.0}
+
     total_trips = int(filtered["Number of scheduled trains"].sum())
     total_cancelled = int(filtered["Number of cancelled trains"].sum())
     avg_delay = float(filtered[TARGET].mean())
-    pct_on_time = float((filtered[TARGET] <= 5).mean() * 100)
+
+    # Ponctualité pondérée par service (au lieu d'un seuil unique à 5 min)
+    thresholds = filtered["Service"].map(PUNCT_THRESHOLDS).fillna(5.0)
+    pct_on_time = float((filtered[TARGET] <= thresholds).mean() * 100)
+
     cancel_rate = (total_cancelled / total_trips * 100) if total_trips else 0.0
 
     c1, c2, c3, c4, c5 = st.columns(5)
     kpi_card(c1, "Trajets programmés", f"{total_trips:,}")
     kpi_card(c2, "Retard moyen à l'arrivée", f"{avg_delay:.1f} min")
-    kpi_card(c3, "% à l'heure (≤ 5 min)", f"{pct_on_time:.1f} %")
+    kpi_card(
+        c3,
+        "% à l'heure",
+        f"{pct_on_time:.1f} %",
+        help_text="Seuil par service : National ≤ 5 min, International ≤ 15 min",
+    )
     kpi_card(c4, "Trains annulés", f"{total_cancelled:,}")
     kpi_card(c5, "Taux d'annulation", f"{cancel_rate:.2f} %")
 
@@ -404,10 +418,17 @@ def main() -> None:
         st.caption(
             "Choisis une gare de départ et d'arrivée existante. "
             "Les caractéristiques du trajet (service, temps de parcours, volume) "
-            "sont déterminées automatiquement à partir de l'historique."
+            "sont déterminées automatiquement à partir de l'historique **antérieur "
+            "à la date de prédiction**."
         )
 
-        route_groups = df.groupby(["Departure station", "Arrival station"])
+        # Cutoff train stocké dans l'artifact ; fallback = max des dates train utilisées
+        # au moment du fit. On s'en sert pour ne PAS utiliser de lignes futures comme
+        # meta d'une route à l'inférence (sinon : fuite test → prédiction).
+        train_cutoff = pd.Timestamp(artifact.get("train_cutoff", df["Date"].max()))
+        df_train_slice = df[df["Date"] < train_cutoff]
+
+        route_groups = df_train_slice.groupby(["Departure station", "Arrival station"])
         route_meta = route_groups.agg(
             service=("Service", lambda s: s.mode().iloc[0]),
             journey_time=("Average journey time", "median"),
@@ -419,15 +440,32 @@ def main() -> None:
         ).reset_index()
 
         MONTH_LABELS = {
-            1: "Janvier", 2: "Février", 3: "Mars", 4: "Avril",
-            5: "Mai", 6: "Juin", 7: "Juillet", 8: "Août",
-            9: "Septembre", 10: "Octobre", 11: "Novembre", 12: "Décembre",
+            1: "Janvier",
+            2: "Février",
+            3: "Mars",
+            4: "Avril",
+            5: "Mai",
+            6: "Juin",
+            7: "Juillet",
+            8: "Août",
+            9: "Septembre",
+            10: "Octobre",
+            11: "Novembre",
+            12: "Décembre",
         }
         SEASON_MAP = {
-            12: "Winter", 1: "Winter", 2: "Winter",
-            3: "Spring", 4: "Spring", 5: "Spring",
-            6: "Summer", 7: "Summer", 8: "Summer",
-            9: "Autumn", 10: "Autumn", 11: "Autumn",
+            12: "Winter",
+            1: "Winter",
+            2: "Winter",
+            3: "Spring",
+            4: "Spring",
+            5: "Spring",
+            6: "Summer",
+            7: "Summer",
+            8: "Summer",
+            9: "Autumn",
+            10: "Autumn",
+            11: "Autumn",
         }
 
         # --- Sélecteurs interactifs (hors formulaire pour la cascade dep → arr) ---
@@ -440,7 +478,9 @@ def main() -> None:
         )
 
         valid_arrivals = sorted(
-            route_meta.loc[route_meta["Departure station"] == dep, "Arrival station"].unique()
+            route_meta.loc[
+                route_meta["Departure station"] == dep, "Arrival station"
+            ].unique()
         )
         arr = col_arr.selectbox(
             "Gare d'arrivée",
@@ -488,40 +528,51 @@ def main() -> None:
             submit = st.form_submit_button("Prédire le retard", type="primary")
 
         if submit:
+
             def build_row(yr: int, mo: int) -> pd.DataFrame:
-                return pd.DataFrame(
-                    [
-                        {
-                            "Departure station": dep,
-                            "Arrival station": arr,
-                            "Service": meta["service"],
-                            "Season": SEASON_MAP[mo],
-                            "Year": yr,
-                            "Month": mo,
-                            "Quarter": (mo - 1) // 3 + 1,
-                            "Average journey time": float(meta["journey_time"]),
-                            "Number of scheduled trains": float(meta["scheduled"]),
-                            "IsPeakMonth": int(mo in (7, 8, 12)),
-                            "IsParisDeparture": int("PARIS" in dep.upper()),
-                            "IsParisArrival": int("PARIS" in arr.upper()),
-                        }
-                    ]
-                )[features]
+                row = {
+                    "Departure station": dep,
+                    "Arrival station": arr,
+                    "Service": meta["service"],
+                    "Season": SEASON_MAP[mo],
+                    "Year": yr,
+                    "Month": mo,
+                    "Quarter": (mo - 1) // 3 + 1,
+                    "MonthSin": float(np.sin(2 * np.pi * mo / 12)),
+                    "MonthCos": float(np.cos(2 * np.pi * mo / 12)),
+                    "Average journey time": float(meta["journey_time"]),
+                    "Number of scheduled trains": float(meta["scheduled"]),
+                    "IsPeakMonth": int(mo in (7, 8, 12)),
+                    "IsWorksMonth": int(mo in (6, 7, 8, 9)),
+                    "IsParisDeparture": int("PARIS" in dep.upper()),
+                    "IsParisArrival": int("PARIS" in arr.upper()),
+                }
+                # Toutes les features attendues par le pipeline — on remplit
+                # uniquement celles présentes dans `row` ; le reste serait
+                # manquant (mais le pipeline a un imputer).
+                return pd.DataFrame([{k: row.get(k) for k in features}])
 
             prediction = float(pipeline.predict(build_row(int(year), int(month)))[0])
-            rmse = artifact["metrics"]["rmse"]
-            low = prediction - 1.96 * rmse
-            high = prediction + 1.96 * rmse
+
+            # IC correct : ± 1.96 × std(résidus) (le RMSE inclut le biais et n'est
+            # pas σ). Fallback sur RMSE si residual_std absent (ancien artifact).
+            sigma = artifact["metrics"].get("residual_std", artifact["metrics"]["rmse"])
+            bias = artifact["metrics"].get("residual_bias", 0.0)
+            low = prediction - 1.96 * sigma
+            high = prediction + 1.96 * sigma
 
             st.success(f"**Retard prédit : {prediction:.1f} minutes**")
             st.caption(
-                f"Intervalle approximatif (± 1.96 × RMSE, résidus supposés gaussiens) : "
-                f"[{low:.1f} ; {high:.1f}] min — RMSE modèle = {rmse:.2f} min. "
-                "À interpréter avec prudence (résidus hétéroscédastiques)."
+                f"Intervalle approximatif (± 1.96 × σ_résidus) : "
+                f"[{low:.1f} ; {high:.1f}] min — σ = {sigma:.2f} min, "
+                f"biais moyen du modèle = {bias:+.2f} min. "
+                "Interprétation prudente : résidus hétéroscédastiques, "
+                "la variance réelle dépend du niveau prédit."
             )
 
             st.info(
-                f"📚 **Historique** sur {dep} → {arr} ({int(meta['n_months'])} mois) : "
+                f"📚 **Historique** sur {dep} → {arr} ({int(meta['n_months'])} mois "
+                f"avant {train_cutoff:%Y-%m}) : "
                 f"retard moyen observé **{meta['avg_delay']:.1f} min**, "
                 f"médiane **{meta['median_delay']:.1f} min**."
             )
