@@ -50,7 +50,7 @@ from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
@@ -115,14 +115,37 @@ print(f"Cible : moyenne {y.mean():.2f} min, écart-type {y.std():.2f} min")
 """
 )
 
-md("## 3. Split train / test")
+md(
+    """## 3. Split train / test — **temporel**
+
+> Un split aléatoire fuit l'information temporelle : le modèle verrait des observations
+> de 2024 pendant l'entraînement puis serait évalué sur 2023. Comme la ponctualité
+> SNCF évolue structurellement (COVID, grèves, reprises), cela gonfle artificiellement
+> les métriques. On adopte un **split temporel** : les ~80 % des trajets-mois les plus
+> anciens pour l'entraînement, les ~20 % les plus récents pour le test. C'est le
+> protocole standard pour tout système prédictif qui sera déployé "vers le futur"."""
+)
 
 code(
-    """X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=RANDOM_STATE
-)
-print(f"Train : {X_train.shape[0]:,} | Test : {X_test.shape[0]:,}")
-"""
+    '''df_sorted = df.sort_values("Date").reset_index(drop=True)
+X_sorted = df_sorted[FEATURES].copy()
+y_sorted = df_sorted[TARGET].copy()
+dates_sorted = df_sorted["Date"]
+
+cutoff_idx = int(len(df_sorted) * 0.8)
+cutoff_date = dates_sorted.iloc[cutoff_idx]
+
+X_train = X_sorted.iloc[:cutoff_idx]
+X_test = X_sorted.iloc[cutoff_idx:]
+y_train = y_sorted.iloc[:cutoff_idx]
+y_test = y_sorted.iloc[cutoff_idx:]
+
+print(f"Cutoff date : {cutoff_date:%Y-%m}")
+print(f"Train : {len(X_train):,} trajets-mois  ({dates_sorted.iloc[0]:%Y-%m} → {dates_sorted.iloc[cutoff_idx - 1]:%Y-%m})")
+print(f"Test  : {len(X_test):,} trajets-mois  ({dates_sorted.iloc[cutoff_idx]:%Y-%m} → {dates_sorted.iloc[-1]:%Y-%m})")
+print(f"Cible train : moyenne {y_train.mean():.2f} min, écart-type {y_train.std():.2f} min")
+print(f"Cible test  : moyenne {y_test.mean():.2f} min, écart-type {y_test.std():.2f} min")
+'''
 )
 
 md("## 4. Pré-traitement")
@@ -221,15 +244,19 @@ code(
     "est__learning_rate": [0.05, 0.1],
 }
 
+tscv = TimeSeriesSplit(n_splits=4)
+
 search = GridSearchCV(
     gb,
     param_grid=param_grid,
     scoring="neg_root_mean_squared_error",
-    cv=3,
+    cv=tscv,
     n_jobs=-1,
     verbose=0,
 )
 
+# Important : X_train est déjà trié par date (split temporel), donc TimeSeriesSplit
+# découpe les folds dans l'ordre chronologique → pas de fuite.
 search.fit(X_train, y_train)
 print(f"Meilleurs hyperparamètres : {search.best_params_}")
 print(f"RMSE CV : {-search.best_score_:.3f}")
