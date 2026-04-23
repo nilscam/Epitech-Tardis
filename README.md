@@ -27,13 +27,13 @@ TARDIS analyse un dataset d'agrégations **mensuelles** des trajets SNCF
 
 Évalué sur un **split temporel** (train 2018-01 → 2024-05 ; test 2024-05 → 2025-12) :
 
-| Modèle | RMSE (min) | MAE (min) | R² |
-|---|---:|---:|---:|
-| Baseline (moyenne d'entraînement) | 4.25 | 3.02 | −0.07 |
-| Ridge Regression | 3.42 | 2.44 | +0.31 |
-| Random Forest | 3.39 | 2.41 | +0.32 |
-| Gradient Boosting | 3.40 | 2.45 | +0.31 |
-| **Gradient Boosting tuné** | **3.50** | **2.52** | **+0.27** |
+| Modèle                            | RMSE (min) | MAE (min) |        R² |
+|:----------------------------------|----------:|---------:|---------:|
+| Baseline (moyenne d'entraînement) |       4.25 |      3.02 |     −0.07 |
+| Ridge Regression                  |       3.42 |      2.44 |     +0.31 |
+| Random Forest                     |       3.39 |      2.41 |     +0.32 |
+| Gradient Boosting                 |       3.40 |      2.45 |     +0.31 |
+| **Gradient Boosting tuné**        |   **3.50** |  **2.52** | **+0.27** |
 
 > **Lecture :** la baseline obtient un R² **négatif** sur le test, car le retard moyen
 > a augmenté entre la période d'entraînement (5.94 min) et la période de test (7.02 min).
@@ -103,13 +103,13 @@ Le dashboard s'ouvre sur <http://localhost:8501>.
 
 ## Contenu du dashboard
 
-| Onglet | Fonctionnalités |
-|---|---|
-| **📈 Distribution** | Histogramme + KDE des retards, répartition par catégorie, boxplot par service |
-| **🚉 Par gare** | Top gares les plus en retard / plus ponctuelles, tableau détaillé, export CSV |
-| **📅 Tendances** | Série temporelle mensuelle, comparaison mois / année, heatmap année × mois |
-| **🔗 Corrélations** | Matrice de corrélation + contribution moyenne des causes de retard |
-| **🔮 Prédiction** | Formulaire de saisie, prédiction + intervalle de confiance, scénario alternatif |
+| Onglet             | Fonctionnalités                                                                 |
+|:-------------------|:--------------------------------------------------------------------------------|
+| **📈 Distribution** | Histogramme + KDE des retards, répartition par catégorie, boxplot par service   |
+| **🚉 Par gare**     | Top gares les plus en retard / plus ponctuelles, tableau détaillé, export CSV   |
+| **📅 Tendances**    | Série temporelle mensuelle, comparaison mois / année, heatmap année × mois      |
+| **🔗 Corrélations** | Matrice de corrélation + contribution moyenne des causes de retard              |
+| **🔮 Prédiction**   | Formulaire de saisie, prédiction + intervalle de confiance, scénario alternatif |
 
 **Filtres sidebar** : type de service, plage de dates, gares de départ et d'arrivée.
 Tous les graphes et KPIs se mettent à jour dynamiquement.

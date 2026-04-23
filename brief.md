@@ -14,11 +14,11 @@ Le dashboard que vous produirez pourra être utilisé par des milliers de voyage
 
 ## Préliminaires
 
-| Élément | Détail |
-|---|---|
-| **Fichiers à rendre** | `tardis_eda.ipynb`, `tardis_model.ipynb`, `tardis_dashboard.py` |
-| **Langage** | Python — pandas, numpy, matplotlib, seaborn, scikit-learn, streamlit |
-| **Style de code** | Formaté avec [ruff formatter](https://docs.astral.sh/ruff/) |
+| Élément               | Détail                                                               |
+|:----------------------|:---------------------------------------------------------------------|
+| **Fichiers à rendre** | `tardis_eda.ipynb`, `tardis_model.ipynb`, `tardis_dashboard.py`      |
+| **Langage**           | Python — pandas, numpy, matplotlib, seaborn, scikit-learn, streamlit |
+| **Style de code**     | Formaté avec [ruff formatter](https://docs.astral.sh/ruff/)          |
 
 ---
 
@@ -80,11 +80,11 @@ Construire un **modèle de régression** pour prédire la durée du retard en mi
 
 ### Cible de prédiction
 
-| Élément | Détail |
-|---|---|
-| **Variable cible** | Durée du retard (valeur continue en minutes) |
+| Élément                  | Détail                                                                             |
+|:-------------------------|:-----------------------------------------------------------------------------------|
+| **Variable cible**       | Durée du retard (valeur continue en minutes)                                       |
 | **Exemples de features** | Gare de départ, gare d'arrivée, heure de départ, jour de la semaine, type de train |
-| **Exigence minimale** | Le modèle doit surpasser une baseline (ex. : prédire le retard moyen) |
+| **Exigence minimale**    | Le modèle doit surpasser une baseline (ex. : prédire le retard moyen)              |
 
 ### Tâches
 
@@ -148,15 +148,15 @@ Un script Python **`tardis_dashboard.py`** avec :
 
 ## Récapitulatif des livrables
 
-| Fichier | Description |
-|---|---|
-| `requirements.txt` | Toutes les dépendances du projet |
-| `tardis_eda.ipynb` | Nettoyage, exploration et feature engineering |
-| `cleaned_dataset.csv` | Dataset traité issu du notebook EDA |
-| `tardis_model.ipynb` | Entraînement, évaluation et sélection du modèle |
-| `model.pkl` ou `model.joblib` | Fichier du modèle entraîné |
-| `tardis_dashboard.py` | Dashboard Streamlit interactif |
-| `README.md` | Documentation d'installation, d'usage et du projet |
+| Fichier                       | Description                                        |
+|:------------------------------|:---------------------------------------------------|
+| `requirements.txt`            | Toutes les dépendances du projet                   |
+| `tardis_eda.ipynb`            | Nettoyage, exploration et feature engineering      |
+| `cleaned_dataset.csv`         | Dataset traité issu du notebook EDA                |
+| `tardis_model.ipynb`          | Entraînement, évaluation et sélection du modèle    |
+| `model.pkl` ou `model.joblib` | Fichier du modèle entraîné                         |
+| `tardis_dashboard.py`         | Dashboard Streamlit interactif                     |
+| `README.md`                   | Documentation d'installation, d'usage et du projet |
 
 ---
 
