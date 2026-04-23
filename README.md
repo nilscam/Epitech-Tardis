@@ -3,6 +3,8 @@
 Projet Epitech d'analyse et de prédiction des retards ferroviaires SNCF.
 Pipeline complet : exploration de données → modélisation prédictive → dashboard interactif.
 
+Project is live on : https://nilscam-epitech-tardis-tardis-dashboard-eicl6m.streamlit.app/
+
 ---
 
 ## Aperçu
