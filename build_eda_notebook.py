@@ -138,12 +138,53 @@ def parse_month(value: object) -> pd.Timestamp:
 '''
 )
 
-code(
-    """df = raw.copy()
+md(
+    """### Normalisation des noms de gares
 
-# Strip whitespace on string columns (stations, service)
-for col in ["Service", "Departure station", "Arrival station"]:
-    df[col] = df[col].astype("string").str.strip()
+Le dataset source comporte la **même gare écrite de plusieurs façons** :
+
+- casse hétérogène : `PARIS LYON`, `Paris Lyon`, `paris lyon`
+- abréviations inconsistantes : `ST MALO` vs `SAINT MALO`, `ANGERS ST LAUD` vs `ANGERS SAINT LAUD`, `BORDEAUX ST JEAN` vs `BORDEAUX SAINT JEAN`
+- `TGV` parfois en minuscules (`Tgv`)
+- valeurs parasites (`'0'`)
+
+Sans normalisation, le modèle traite chaque variante comme une gare distincte
+→ encoding one-hot inutilement large, splits train/test qui "inventent" des
+gares, classements faussés dans le dashboard. On unifie tout en passant par
+une forme canonique (MAJUSCULES, `ST ` normalisé en `SAINT `, espaces dédoublés)."""
+)
+
+code(
+    '''import unicodedata
+
+
+def normalise_station(value: object) -> object:
+    """Canonical form: uppercase, no accents, SAINT (not ST), single spaces."""
+    if pd.isna(value):
+        return value
+    text = str(value).strip()
+    if not text:
+        return pd.NA
+    # Remove diacritics (SAINT-ÉTIENNE → SAINT-ETIENNE)
+    text = "".join(
+        c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)
+    )
+    text = text.upper()
+    # Expand the ST / ST. abbreviation (word-boundary) into SAINT
+    text = re.sub(r"\\bST\\.?\\b", "SAINT", text)
+    # Collapse multiple spaces / dashes
+    text = re.sub(r"[\\s\\-]+", " ", text).strip()
+    if not text or text == "0":
+        return pd.NA
+    return text
+
+
+df = raw.copy()
+
+# Normalise station names and service
+for col in ["Departure station", "Arrival station"]:
+    df[col] = df[col].apply(normalise_station)
+df["Service"] = df["Service"].astype("string").str.strip().str.title()
 
 # Normalise date
 df["Date"] = df["Date"].apply(parse_month)
@@ -152,9 +193,10 @@ df["Date"] = df["Date"].apply(parse_month)
 for col in NUMERIC_COLS:
     df[col] = df[col].apply(parse_number)
 
-print("Types après nettoyage :")
-print(df.dtypes.value_counts())
-"""
+print(f"Gares de départ uniques après normalisation  : {df['Departure station'].nunique()}")
+print(f"Gares d'arrivée uniques après normalisation : {df['Arrival station'].nunique()}")
+print(f"Types de service : {df['Service'].dropna().unique().tolist()}")
+'''
 )
 
 code(
@@ -163,12 +205,13 @@ comment_cols = [c for c in df.columns if "comments" in c.lower()]
 df = df.drop(columns=comment_cols)
 print(f"Colonnes commentaires supprimées : {comment_cols}")
 
-# Drop duplicates
+# Drop duplicates — important de le faire APRÈS normalisation des gares
+# (sinon 'PARIS LYON' et 'Paris Lyon' comptent comme des lignes distinctes)
 before = len(df)
 df = df.drop_duplicates()
 print(f"Doublons supprimés : {before - len(df)}")
 
-# Drop rows without target or without essential keys
+# Drop rows without target or without essential keys (incluant parasites '0' → NA)
 TARGET = "Average delay of all trains at arrival"
 essentials = ["Date", "Service", "Departure station", "Arrival station", TARGET]
 before = len(df)
