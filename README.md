@@ -10,15 +10,35 @@ Pipeline complet : exploration de données → modélisation prédictive → das
 TARDIS analyse un dataset d'agrégations **mensuelles** des trajets SNCF
 (gare de départ → gare d'arrivée) entre 2018 et 2025 et fournit :
 
-1. Un **notebook d'exploration** (`tardis_eda.ipynb`) — nettoyage, feature engineering,
-   statistiques et visualisations.
-2. Un **notebook de modélisation** (`tardis_model.ipynb`) — comparaison de 3 modèles
-   de régression, tuning d'hyperparamètres et sauvegarde d'un modèle réutilisable.
+1. Un **notebook d'exploration** (`tardis_eda.ipynb`) — nettoyage, normalisation
+   des gares, feature engineering, statistiques et visualisations.
+2. Un **notebook de modélisation** (`tardis_model.ipynb`) — comparaison de 4 modèles
+   de régression, tuning d'hyperparamètres avec validation temporelle, analyse des
+   résidus et de l'importance des features.
 3. Un **dashboard Streamlit** (`tardis_dashboard.py`) — KPIs, visualisations
    interactives avec filtres et interface de prédiction.
 
 **Cible du modèle :** `Average delay of all trains at arrival` (retard moyen
 à l'arrivée en minutes, valeur continue).
+
+---
+
+## Performance du modèle
+
+Évalué sur un **split temporel** (train 2018-01 → 2024-05 ; test 2024-05 → 2025-12) :
+
+| Modèle | RMSE (min) | MAE (min) | R² |
+|---|---:|---:|---:|
+| Baseline (moyenne d'entraînement) | 4.25 | 3.02 | −0.07 |
+| Ridge Regression | 3.42 | 2.44 | +0.31 |
+| Random Forest | 3.39 | 2.41 | +0.32 |
+| Gradient Boosting | 3.40 | 2.45 | +0.31 |
+| **Gradient Boosting tuné** | **3.50** | **2.52** | **+0.27** |
+
+> **Lecture :** la baseline obtient un R² **négatif** sur le test, car le retard moyen
+> a augmenté entre la période d'entraînement (5.94 min) et la période de test (7.02 min).
+> Le modèle gagne environ **+0.34 R² vs baseline** — c'est un signal exploitable malgré
+> l'absence dans le dataset d'informations granulaires (heure, jour de la semaine).
 
 ---
 
@@ -60,7 +80,7 @@ Ou ouvrir le notebook dans Jupyter Lab pour l'exécuter cellule par cellule :
 jupyter lab tardis_eda.ipynb
 ```
 
-**Sortie :** `cleaned_dataset.csv` (~11 000 lignes, 35 colonnes).
+**Sortie :** `cleaned_dataset.csv` (~11 000 lignes × 35 colonnes, gares normalisées).
 
 ### 2. Entraînement du modèle
 
@@ -114,10 +134,21 @@ tardis/
 
 ## Décisions techniques
 
-- **Parsing tolérant** du CSV : le dataset source mélange séparateurs décimaux
-  (`.` et `,`), unités parasites (`6.9 min`), espaces dans les chiffres et
-  deux formats de date (`YYYY-MM`, `YYYY/MM`). Un parser dédié normalise tout
-  cela dans l'EDA.
+- **Parsing tolérant du CSV source** : le dataset d'origine mélange séparateurs
+  décimaux (`.` et `,`), unités parasites (`6.9 min`), espaces dans les chiffres
+  et deux formats de date (`YYYY-MM`, `YYYY/MM`). Un parser dédié normalise
+  tout cela dans l'EDA.
+- **Normalisation des gares** : le dataset brut contient la même gare écrite
+  de plusieurs façons (`PARIS LYON` / `Paris Lyon` / `paris lyon`,
+  `ST MALO` / `SAINT MALO`, `Tgv` vs `TGV`, valeur parasite `'0'`).
+  Une fonction dédiée (`normalise_station`) applique : suppression des diacritiques,
+  uppercase, `ST` → `SAINT`, compactage des espaces/tirets, filtrage des parasites.
+  **Résultat : 132 → 59 gares uniques**, ce qui a quasi-doublé le R² du modèle.
+- **Split temporel** (vs aléatoire) : train = ~80 % des trajets-mois les plus
+  anciens, test = 20 % les plus récents. Un split aléatoire masquait la **dérive
+  temporelle** (retards moyens en hausse sur la période récente). Le tuning
+  `GridSearchCV` utilise en conséquence `TimeSeriesSplit` pour conserver
+  l'ordre chronologique dans la validation croisée.
 - **Winsorisation** de la cible à `[-30 ; 120]` minutes pour neutraliser les
   outliers aberrants sans perdre d'information.
 - **Anti-fuite de cible** : le modèle utilise uniquement des features disponibles
@@ -125,10 +156,10 @@ tardis/
   trains planifiés). Les variables fortement corrélées à la cible (retards au
   départ, nombre de trains en retard, causes) sont **exclues** — sinon le R²
   serait artificiellement ~1.
-- **Modèle retenu** : **Gradient Boosting Regressor** tuné par `GridSearchCV`.
-  Il bat la baseline (prédire la moyenne) d'environ 18 % sur le RMSE de test,
-  ce qui constitue un signal utile compte tenu de l'absence d'informations
-  granulaires (heure, jour de la semaine) dans le dataset source.
+- **Modèle retenu** : **Gradient Boosting Regressor** tuné par `GridSearchCV` +
+  `TimeSeriesSplit`. Hyperparamètres retenus : `n_estimators=200`,
+  `max_depth=3`, `learning_rate=0.05` (profil plus régularisé qu'un split
+  aléatoire car plus de signal à extraire sur des données vraiment futures).
 - **OneHotEncoder(handle_unknown="ignore")** : le pipeline encode à zéro toute
   gare jamais vue à l'entraînement — robustesse à l'inférence.
 
@@ -140,8 +171,14 @@ tardis/
   (pas d'heure ni de jour de la semaine dans le dataset).
 - **Chocs exogènes** (grèves, canicules, pannes majeures) non modélisables
   sans features externes.
-- Les retards sont **très hétéroscédastiques** (forte variance conditionnelle) ;
-  l'intervalle de confiance à ± 1,96 × RMSE est une approximation.
+- **Hétéroscédasticité des résidus** : la variance de l'erreur dépend du niveau
+  prédit. L'intervalle affiché dans le dashboard (`± 1.96 × RMSE`) est donc une
+  approximation — il est surdimensionné pour les petits retards et sous-dimensionné
+  pour les gros. Une version plus rigoureuse utiliserait de la *quantile
+  regression* ou de la *conformal prediction*.
+- **Dérive temporelle** : sur la période de test (2024-2025), le retard moyen
+  réel est plus élevé que sur la période d'entraînement. Le modèle reste
+  utilisable mais sous-estime légèrement l'ampleur des retards récents.
 
 ---
 
