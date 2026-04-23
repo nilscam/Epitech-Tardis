@@ -182,9 +182,10 @@ def main() -> None:
         [
             "📈 Distribution",
             "🚉 Par gare",
-            "📅 Tendances",
+            "📅 Évolution",
             "🔗 Corrélations",
             "🔮 Prédiction",
+            "📝 Synthèse",
         ]
     )
 
@@ -523,6 +524,17 @@ def main() -> None:
                 f"📚 **Historique** sur {dep} → {arr} ({int(meta['n_months'])} mois) : "
                 f"retard moyen observé **{meta['avg_delay']:.1f} min**, "
                 f"médiane **{meta['median_delay']:.1f} min**."
+            )
+
+    # ---- Tab 6 : Synthèse ----
+    with tabs[5]:
+        synthese_path = Path("SYNTHESE.md")
+        if synthese_path.exists():
+            st.markdown(synthese_path.read_text(encoding="utf-8"))
+        else:
+            st.warning(
+                f"Fichier `{synthese_path}` introuvable. "
+                "Place une synthèse Markdown à la racine du projet."
             )
 
     st.divider()
